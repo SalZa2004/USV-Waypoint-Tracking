@@ -19,7 +19,7 @@ ser = serial.Serial(serial_port, baud_rate, timeout=1)
 # Constants for Waypoint Tracking
 # -----------------------------
 heading_error_threshold = 5      # Degrees: if error is below, considered "on course"
-distance_threshold = 12.0         # Meters: waypoint reached
+distance_threshold = 10.0         # Meters: waypoint reached
 max_rz_thrust = 100.0
 kp = 1.5                       # Proportional gain for heading error
 
