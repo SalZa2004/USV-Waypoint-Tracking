@@ -6,7 +6,9 @@ import tkinter as tk
 from tkinter import ttk
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import socket
+import csv
+import os
+
 
 # -----------------------------
 # Serial Configuration
@@ -35,12 +37,23 @@ TURNING_THRESHOLD = 10     # Degrees error above which full speed reduction is a
 # -----------------------------
 # Cross-track Error Controller Gains (for PID)
 # -----------------------------
-K_xte = 2.9    # Proportional gain
+K_xte = 2.90    # Proportional gain
 Ki_xte = 0.032  # Integral gain
-KD_xte = 0.96   # Derivative gain for cross-track error
+KD_xte = 0.075   # Derivative gain for cross-track error
 
 # For the derivative calculation, store previous xte
 prev_xte = 0.0
+
+log_filename = "log.csv"
+log_exists = os.path.exists(log_filename)
+
+
+with open(log_filename, mode='a', newline='') as logfile:
+    log_writer = csv.writer(logfile)
+
+    # Write header only if file doesn't exist
+    if not log_exists:
+        log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "Thrust"])
 
 # -----------------------------
 # GUI Setup
@@ -60,6 +73,8 @@ heading_label = ttk.Label(root, text="Heading: ---°", font=("Arial", 15))
 heading_label.pack()
 xte_label = ttk.Label(root, text="XTE: --.- m", font=("Arial", 15))
 xte_label.pack()
+distance_label = ttk.Label(root, text="Distance: --.- m", font=("Arial", 15))
+distance_label.pack()
 
 path = []
 start_pos = None  # Will be set to the first valid RMC reading
@@ -228,7 +243,20 @@ def update_gui():
 
                 speed_label.config(text=f"Speed: {current_speed*1.94384:.1f} kts")
                 heading_label.config(text=f"Heading: {current_heading:.1f}°")
-
+                distance_label.config(text=f"Distance: {distance:.1f} m")
+                with open('log.csv', 'a', newline='') as f:  # 'a' for append
+                    log_writer = csv.writer(f)
+                    log_writer.writerow([
+                        time.strftime("%Y-%m-%d %H:%M:%S"),
+                        current_lat,
+                        current_lon,
+                        current_speed*1.94384,
+                        current_heading,
+                        distance,
+                        heading_error,
+                        signed_xte,
+                        rz_thrust
+                    ])                
                 # --- Visualization ---
                 ax.clear()
                 ax.set_title("Navigation Visualisation")
