@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv
 import os
-
+from datetime import datetime
 
 # -----------------------------
 # Serial Configuration
@@ -39,21 +39,20 @@ TURNING_THRESHOLD = 10     # Degrees error above which full speed reduction is a
 # -----------------------------
 K_xte = 2.90    # Proportional gain
 Ki_xte = 0.032  # Integral gain
-KD_xte = 0.075   # Derivative gain for cross-track error
+KD_xte = 0.07   # Derivative gain for cross-track error
 
 # For the derivative calculation, store previous xte
 prev_xte = 0.0
 
-log_filename = "log.csv"
-log_exists = os.path.exists(log_filename)
 
+# Create a unique filename based on the current date and time
+log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-with open(log_filename, mode='a', newline='') as logfile:
+with open(log_filename, mode='w', newline='') as logfile:
     log_writer = csv.writer(logfile)
 
-    # Write header only if file doesn't exist
-    if not log_exists:
-        log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "Thrust"])
+    # Write header for every new file
+    log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "Thrust"])
 
 # -----------------------------
 # GUI Setup
@@ -179,7 +178,7 @@ def update_gui():
                 start_pos = (lat, lon)
                 print("Start position acquired:", start_pos)
 
-        waypoints = parse_waypoints('waypoints/waypoints2.txt')
+        waypoints = parse_waypoints('waypoints/zigzag.txt')
         send_command('$CCAPM,0,64,0,80')
         send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
         time.sleep(1)
@@ -244,7 +243,7 @@ def update_gui():
                 speed_label.config(text=f"Speed: {current_speed*1.94384:.1f} kts")
                 heading_label.config(text=f"Heading: {current_heading:.1f}°")
                 distance_label.config(text=f"Distance: {distance:.1f} m")
-                with open('log.csv', 'a', newline='') as f:  # 'a' for append
+                with open(log_filename, 'a', newline='') as f:  # 'a' for append
                     log_writer = csv.writer(f)
                     log_writer.writerow([
                         time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -256,13 +255,15 @@ def update_gui():
                         heading_error,
                         signed_xte,
                         rz_thrust
-                    ])                
+                    ])  
+
+                              
                 # --- Visualization ---
                 ax.clear()
                 ax.set_title("Navigation Visualisation")
                 ax.set_facecolor('xkcd:powder blue')
                 ax.grid(True)
-                ax.set_xlim(min(wp[1] for wp in waypoints) - 0.0001, max(wp[1] for wp in waypoints) + 0.0001)
+                ax.set_xlim(min(wp[1] for wp in waypoints) - 0.001, max(wp[1] for wp in waypoints) + 0.001)
                 ax.set_ylim(min(wp[0] for wp in waypoints) - 0.0001, max(wp[0] for wp in waypoints) + 0.0001)
 
                 # Plot start -> first waypoint line
