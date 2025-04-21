@@ -23,30 +23,39 @@ ser = serial.Serial(serial_port, baud_rate, timeout=1)
 heading_error_threshold = 5      # Degrees: if error is below, considered "on course"
 distance_threshold = 10.0         # Meters: waypoint reached
 max_rz_thrust = 100.0
-kp = 1.5                       # Proportional gain for heading error
+BASE_FORWARD_THRUST = 83.3  # approx 5 knots
+MAX_THRUST = 100.0
+MIN_THRUST = 0.0
 
 # -----------------------------
-# Speed Controller Settings (mapping to knots)
+# PID Controller Settings
 # -----------------------------
-# When going straight, command speed should be 5.0 knots
-# When turning hard, command speed should be 1.0 knot
-BASE_FORWARD_THRUST = 84.70    # Corresponds to 5.0 knots
-MIN_FORWARD_THRUST = 7.00     # Corresponds to 1.0 knot
-TURNING_THRESHOLD = 10     # Degrees error above which full speed reduction is applied
 
-# -----------------------------
-# Cross-track Error Controller Gains (for PID)
-# -----------------------------
-K_xte = 2.90    # Proportional gain
-Ki_xte = 0.032  # Integral gain
-KD_xte = 0.07   # Derivative gain for cross-track error
+class PIDController:
+    def __init__(self, kp, ki, kd, dt):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.dt = dt
+        self.prev_error = 0.0
+        self.integral = 0.0
 
-# For the derivative calculation, store previous xte
-prev_xte = 0.0
+    def update(self, error):
+        self.integral += error * self.dt
+        derivative = (error - self.prev_error) / self.dt
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        self.prev_error = error
+        return output
+
+heading_PID = PIDController(kp=2.2, ki=0.032, kd=1.25, dt=1.0) # Proportional control for heading
+xte_PID = PIDController(kp=2.5, ki=0.04, kd=0.8, dt=1.0) # Proportional control for cross-track error
+speed_PID = PIDController(kp=50.0, ki=0.0, kd=5.0, dt=1.0) # Proportional control for speed
+
+
 
 
 # Create a unique filename based on the current date and time
-log_filename = f"wind_data/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+log_filename = f"PID_Controller/PID_DATA/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
 with open(log_filename, mode='w', newline='') as logfile:
     log_writer = csv.writer(logfile)
@@ -184,9 +193,8 @@ def calculate_signed_xte(current_pos, previous_wp, current_wp):
 # -----------------------------
 def update_gui():
     global path, start_pos, prev_xte
-    prev_xte = 0.0  # Initialize previous cross-track error
     try:
-        # Wait for the first valid RMC to set start_pos
+        # Wait for first valid RMC
         while start_pos is None:
             send_command('$CCNVO,2,1.0,0,0.0')
             rmc_sentence = ser.readline().decode().strip()
@@ -199,7 +207,7 @@ def update_gui():
         send_command('$CCAPM,0,64,0,80')
         send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
         time.sleep(1)
-        previous_wp = start_pos  # For the first leg
+        previous_wp = start_pos
 
         prev_time = time.time()
 
@@ -218,41 +226,30 @@ def update_gui():
                 if current_lat is None:
                     time.sleep(1)
                     continue
-                # Try reading MWV wind data
+
                 mwv_sentence = ser.readline().decode().strip()
                 wind_angle, wind_speed = parse_mwv(mwv_sentence)
                 if wind_angle is not None and wind_speed is not None:
                     wind_label.config(text=f"Wind: {wind_angle:.1f}° @ {wind_speed:.1f} kts")
 
-
                 bearing = calculate_bearing(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 distance = calculate_distance(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 heading_error = normalize_angle(bearing - current_heading)
-                rz_thrust = kp * heading_error
+                if abs(heading_error) < heading_error_threshold:
+                    speed_error = current_speed - 5.0
+                else:
+                    speed_error = current_speed - 0.0
+
+                # --- Heading PID ---
+                rz_thrust = heading_PID.update(heading_error)
                 rz_thrust = max(-max_rz_thrust, min(rz_thrust, max_rz_thrust))
 
-                # --- Speed Controller ---
-                # If heading error is small, command 5.0 knots; if large, 1.0 knot, else linear interpolation.
-                abs_error = abs(heading_error)
-                if abs_error < heading_error_threshold:
-                    forward_thrust = BASE_FORWARD_THRUST  # 5.0 knots equivalent
-                elif abs_error > TURNING_THRESHOLD:
-                    forward_thrust = MIN_FORWARD_THRUST  # 1.0 knot equivalent
-                else:
-                    reduction = (abs_error - heading_error_threshold) / (TURNING_THRESHOLD - heading_error_threshold)
-                    forward_thrust = BASE_FORWARD_THRUST - reduction * (BASE_FORWARD_THRUST - MIN_FORWARD_THRUST)
-
-                if distance < 15:  # Reduce speed when within twice the distance threshold
-                    forward_thrust = MIN_FORWARD_THRUST - 1.1
-
-                # --- Cross-Track Error Controller with Derivative ---
+                # --- Cross-Track Error PID ---
                 if previous_wp is not None:
                     try:
+                        xte_PID.setpoint = 0.0  # We want XTE to be 0 ideally
                         signed_xte = calculate_signed_xte((current_lat, current_lon), previous_wp, current_wp)
-                        # Derivative term for xte
-                        derivative_xte = (signed_xte - prev_xte) / dt if dt > 0 else 0.0
-                        prev_xte = signed_xte
-                        xte_correction = K_xte * signed_xte + Ki_xte * signed_xte + KD_xte * derivative_xte
+                        xte_correction = xte_PID.update(signed_xte)
                         rz_thrust += xte_correction
                     except Exception as e:
                         print(f"XTE calculation error: {e}")
@@ -260,6 +257,14 @@ def update_gui():
                     xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
                 else:
                     xte_label.config(text="XTE: 0.0 m")
+
+                # --- Speed PID Controller based on heading error ---
+                speed_PID.setpoint = 0.0  # We want heading error to be 0 ideally
+                forward_thrust_adjustment = speed_PID.update(abs(speed_error))
+                forward_thrust = BASE_FORWARD_THRUST + forward_thrust_adjustment
+                forward_thrust = max(MIN_THRUST, min(forward_thrust, MAX_THRUST))
+                if distance < 20:
+                    forward_thrust = MIN_THRUST  # crawl at very low thrust near waypoint
 
                 thrust_command = f'$CCTHD,{forward_thrust:.2f},0.00,0.00,0.00,0.00,{rz_thrust:.2f},0.00,0.00'
                 send_command(thrust_command)
@@ -331,13 +336,13 @@ def update_gui():
                 canvas.draw()
 
                 if distance < distance_threshold:
-                    send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
                     previous_wp = current_wp
-                    time.sleep(2)
+                    time.sleep(1)
                     break
                 time.sleep(1)  # 1Hz update rate
 
         status_label.config(text="All waypoints reached. Mission complete.")
+        send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
         ser.close()
 
     except KeyboardInterrupt:

@@ -9,7 +9,12 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv
 import os
 from datetime import datetime
+import numpy as np
 
+
+
+
+distance_threshold = 10.0  # meters
 # -----------------------------
 # Serial Configuration
 # -----------------------------
@@ -18,33 +23,8 @@ baud_rate = 115200
 ser = serial.Serial(serial_port, baud_rate, timeout=1)
 
 # -----------------------------
-# Constants for Waypoint Tracking
+# Logging Configuration
 # -----------------------------
-heading_error_threshold = 5      # Degrees: if error is below, considered "on course"
-distance_threshold = 10.0         # Meters: waypoint reached
-max_rz_thrust = 100.0
-kp = 1.5                       # Proportional gain for heading error
-
-# -----------------------------
-# Speed Controller Settings (mapping to knots)
-# -----------------------------
-# When going straight, command speed should be 5.0 knots
-# When turning hard, command speed should be 1.0 knot
-BASE_FORWARD_THRUST = 84.70    # Corresponds to 5.0 knots
-MIN_FORWARD_THRUST = 7.00     # Corresponds to 1.0 knot
-TURNING_THRESHOLD = 10     # Degrees error above which full speed reduction is applied
-
-# -----------------------------
-# Cross-track Error Controller Gains (for PID)
-# -----------------------------
-K_xte = 2.90    # Proportional gain
-Ki_xte = 0.032  # Integral gain
-KD_xte = 0.07   # Derivative gain for cross-track error
-
-# For the derivative calculation, store previous xte
-prev_xte = 0.0
-
-
 # Create a unique filename based on the current date and time
 log_filename = f"wind_data/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
@@ -53,6 +33,8 @@ with open(log_filename, mode='w', newline='') as logfile:
 
     # Write header for every new file
     log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "RZ Thrust","Forward Thrust", "WP Lat", "WP Lon",'Bearing to WP', 'Wind Speed (knots)', 'Wind Angle (deg)'])
+
+
 
 # -----------------------------
 # GUI Setup
@@ -75,11 +57,13 @@ xte_label.pack()
 wind_label = ttk.Label(root, text="Wind: ---° @ --.- knots", font=("Arial", 15))
 wind_label.pack()
 
+
 distance_label = ttk.Label(root, text="Distance: --.- m", font=("Arial", 15))
 distance_label.pack()
 
 path = []
 start_pos = None  # Will be set to the first valid RMC reading
+
 
 # -----------------------------
 # Utility Functions
@@ -124,34 +108,63 @@ def send_command(command):
     if response:
         print("Response:", response.strip())
 
+
 def parse_mwv(sentence):
-    if sentence.startswith('$IIMWV'):
-        try:
-            parts = sentence.split(',')
-            wind_angle = float(parts[1])
-            reference = parts[2]  # R = relative, T = true
-            wind_speed = float(parts[3])
-            wind_unit = parts[4]  # 'N' = knots
-            return wind_angle, wind_speed
-        except (ValueError, IndexError):
+    if not sentence.startswith('$IIMWV'):
+        return None, None
+    try:
+        parts = sentence.split(',')
+        wind_angle = float(parts[1])
+        wind_speed = float(parts[3])
+        wind_unit = parts[4]
+        if wind_unit != 'N':
             return None, None
-    return None, None
+        return wind_angle, wind_speed
+    except (ValueError, IndexError):
+        return None, None
 
 
-def parse_rmc(rmc_sentence):
-    parts = rmc_sentence.split(',')
-    if parts[0] != '$GPRMC' or parts[2] == '':
+def parse_rmc(sentence):
+    if not sentence.startswith('$GPRMC'):
         return None, None, None, None
-    lat = float(parts[3][:2]) + float(parts[3][2:]) / 60
-    if parts[4] == 'S':
-        lat = -lat
-    lon = float(parts[5][:3]) + float(parts[5][3:]) / 60
-    if parts[6] == 'W':
-        lon = -lon
-    speed_knots = float(parts[7]) if parts[7] else 0.0
-    speed_mps = speed_knots * 0.514444
-    heading = float(parts[8]) if parts[8] else 0.0
-    return lat, lon, heading, speed_mps
+    try:
+        parts = sentence.split(',')
+        if parts[2] != 'A':
+            return None, None, None, None
+
+        lat = float(parts[3][:2]) + float(parts[3][2:]) / 60
+        if parts[4] == 'S':
+            lat = -lat
+
+        lon = float(parts[5][:3]) + float(parts[5][3:]) / 60
+        if parts[6] == 'W':
+            lon = -lon
+
+        speed_knots = float(parts[7]) if parts[7] else 0.0
+        speed_mps = speed_knots * 0.514444
+        heading = float(parts[8]) if parts[8] else 0.0
+
+        return lat, lon, heading, speed_mps
+    except (ValueError, IndexError):
+        return None, None, None, None
+
+
+def parse_rot(sentence):
+    if not sentence.startswith('$SPROT'):
+        return None
+    try:
+        parts = sentence.split(',')
+        rot_raw = parts[1]
+        status = parts[2] if len(parts) > 2 else 'V'
+
+        if status != 'A':
+            return None
+
+        rot = float(rot_raw) / 60
+        return rot
+    except (ValueError, IndexError):
+        return None
+
 
 def parse_waypoints(filename):
     waypoints = []
@@ -178,6 +191,77 @@ def calculate_signed_xte(current_pos, previous_wp, current_wp):
     path_length = math.hypot(x_target, y_target)
     return cross / path_length if path_length != 0 else 0.0
 
+def solve_mpc(current_lat, current_lon, current_heading, waypoint_lat, waypoint_lon, current_speed, prev_wp, rot):
+    best_cost = float('inf')
+    best_forward_thrust = 0.0
+    best_rz_thrust = 0.0
+
+    dt = 1.0  # timestep (seconds)
+    prediction_horizon = 10  # number of steps (10s prediction)
+
+    # Candidate thrusts to search
+    forward_thrust_candidates = np.linspace(20, 100, 5)  # 20, 40, 60, 80, 100
+    rz_thrust_candidates = np.linspace(-100, 100, 21)     # wider range for sharper turning
+
+    # Desired target speed
+    desired_speed_knots = 5 if current_speed > 2.5 else 1
+    desired_speed_mps = desired_speed_knots * 0.5144  # knots to m/s
+
+    def thrust_to_speed(thrust):
+        return thrust / 100 * 6.0  # assumes max thrust = ~6m/s (tune if needed)
+
+    for forward_thrust in forward_thrust_candidates:
+        for rz_thrust in rz_thrust_candidates:
+            # Initialize predicted state
+            x = current_lon
+            y = current_lat
+            heading = current_heading
+            speed = thrust_to_speed(forward_thrust)
+
+            for _ in range(prediction_horizon):
+                meters_to_deg = 1 / 111320  # approx at equator
+                # Predict position update
+                x += speed * np.cos(np.deg2rad(heading)) * dt * meters_to_deg
+                y += speed * np.sin(np.deg2rad(heading)) * dt * meters_to_deg
+                # Predict heading update
+                if rot is not None:
+                    heading += rot * dt  # slightly bigger gain
+                else:
+                    heading += rz_thrust * dt / 10
+
+            # Final predicted position and heading
+            pred_lat = y
+            pred_lon = x
+            pred_heading = heading
+
+            # Calculate errors
+            pred_distance = calculate_distance(pred_lat, pred_lon, waypoint_lat, waypoint_lon)
+            pred_bearing = calculate_bearing(pred_lat, pred_lon, waypoint_lat, waypoint_lon)
+            predicted_xte = calculate_signed_xte((pred_lat, pred_lon), prev_wp, (waypoint_lat, waypoint_lon))
+            pred_heading_error = abs(normalize_angle(pred_bearing - pred_heading))
+
+            # Cost function
+            cost = 0
+            cost += 50 * abs(predicted_xte)              # cross track error (main priority)
+            cost += 20 * pred_distance                   # reaching the waypoint
+            cost += 0.1 * abs(rz_thrust)                  # avoid crazy spinning
+            cost += 2 * abs(speed - desired_speed_mps)    # encourage desired speed
+            cost += 1000 * max(0, abs(predicted_xte) - 3) # huge penalty if far off path
+            cost += 1000 * max(0, abs(pred_heading_error) - 5)  # penalize bad heading
+
+            # If very close to waypoint, care more about heading accuracy
+            if pred_distance < 3:
+                cost += 500 * abs(pred_heading_error)
+
+            # Select best control input
+            if cost < best_cost:
+                best_cost = cost
+                best_forward_thrust = forward_thrust
+                best_rz_thrust = rz_thrust
+
+    return best_forward_thrust, best_rz_thrust
+
+
 
 # -----------------------------
 # Main Waypoint Tracking Loop
@@ -187,10 +271,10 @@ def update_gui():
     prev_xte = 0.0  # Initialize previous cross-track error
     try:
         # Wait for the first valid RMC to set start_pos
+        sentence = ser.readline().decode().strip()
         while start_pos is None:
             send_command('$CCNVO,2,1.0,0,0.0')
-            rmc_sentence = ser.readline().decode().strip()
-            lat, lon, hdg, spd = parse_rmc(rmc_sentence)
+            lat, lon, hdg, spd = parse_rmc(sentence)
             if lat is not None:
                 start_pos = (lat, lon)
                 print("Start position acquired:", start_pos)
@@ -208,18 +292,19 @@ def update_gui():
             current_wp = (waypoint_lat, waypoint_lon)
             status_label.config(text=f"Navigating to Waypoint {index}: ({waypoint_lat}, {waypoint_lon})")
             while True:
+                rmc_sentence = ser.readline().decode().strip()
+                rot_sentence = ser.readline().decode().strip()
+                mwv_sentence = ser.readline().decode().strip()
                 current_time = time.time()
                 dt = current_time - prev_time
                 prev_time = current_time
 
                 send_command('$CCNVO,2,1.0,0,0.0')
-                rmc_sentence = ser.readline().decode().strip()
                 current_lat, current_lon, current_heading, current_speed = parse_rmc(rmc_sentence)
                 if current_lat is None:
                     time.sleep(1)
                     continue
                 # Try reading MWV wind data
-                mwv_sentence = ser.readline().decode().strip()
                 wind_angle, wind_speed = parse_mwv(mwv_sentence)
                 if wind_angle is not None and wind_speed is not None:
                     wind_label.config(text=f"Wind: {wind_angle:.1f}° @ {wind_speed:.1f} kts")
@@ -228,45 +313,19 @@ def update_gui():
                 bearing = calculate_bearing(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 distance = calculate_distance(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 heading_error = normalize_angle(bearing - current_heading)
-                rz_thrust = kp * heading_error
-                rz_thrust = max(-max_rz_thrust, min(rz_thrust, max_rz_thrust))
+                rot = parse_rot(rot_sentence)
+                forward_thrust, rz_thrust = solve_mpc(current_lat, current_lon, current_heading, waypoint_lat, waypoint_lon, current_speed, previous_wp, rot)
 
-                # --- Speed Controller ---
-                # If heading error is small, command 5.0 knots; if large, 1.0 knot, else linear interpolation.
-                abs_error = abs(heading_error)
-                if abs_error < heading_error_threshold:
-                    forward_thrust = BASE_FORWARD_THRUST  # 5.0 knots equivalent
-                elif abs_error > TURNING_THRESHOLD:
-                    forward_thrust = MIN_FORWARD_THRUST  # 1.0 knot equivalent
-                else:
-                    reduction = (abs_error - heading_error_threshold) / (TURNING_THRESHOLD - heading_error_threshold)
-                    forward_thrust = BASE_FORWARD_THRUST - reduction * (BASE_FORWARD_THRUST - MIN_FORWARD_THRUST)
 
-                if distance < 15:  # Reduce speed when within twice the distance threshold
-                    forward_thrust = MIN_FORWARD_THRUST - 1.1
-
-                # --- Cross-Track Error Controller with Derivative ---
-                if previous_wp is not None:
-                    try:
-                        signed_xte = calculate_signed_xte((current_lat, current_lon), previous_wp, current_wp)
-                        # Derivative term for xte
-                        derivative_xte = (signed_xte - prev_xte) / dt if dt > 0 else 0.0
-                        prev_xte = signed_xte
-                        xte_correction = K_xte * signed_xte + Ki_xte * signed_xte + KD_xte * derivative_xte
-                        rz_thrust += xte_correction
-                    except Exception as e:
-                        print(f"XTE calculation error: {e}")
-                        signed_xte = 0.0
-                    xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
-                else:
-                    xte_label.config(text="XTE: 0.0 m")
-
+                signed_xte = calculate_signed_xte((current_lat, current_lon), previous_wp, current_wp)
                 thrust_command = f'$CCTHD,{forward_thrust:.2f},0.00,0.00,0.00,0.00,{rz_thrust:.2f},0.00,0.00'
                 send_command(thrust_command)
 
+                xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
                 speed_label.config(text=f"Speed: {current_speed*1.94384:.1f} kts")
                 heading_label.config(text=f"Heading: {current_heading:.1f}°")
                 distance_label.config(text=f"Distance: {distance:.1f} m")
+
 
                 with open(log_filename, 'a', newline='') as f:  # 'a' for append
                     log_writer = csv.writer(f)

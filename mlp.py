@@ -1,5 +1,7 @@
+import time
 import serial
 import time
+from datetime import datetime
 import math
 import threading
 import tkinter as tk
@@ -8,7 +10,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv
 import os
-from datetime import datetime
+import joblib
+import numpy as np
+from math import atan2, radians, degrees
 
 # -----------------------------
 # Serial Configuration
@@ -17,46 +21,32 @@ serial_port = 'COM5'
 baud_rate = 115200
 ser = serial.Serial(serial_port, baud_rate, timeout=1)
 
-# -----------------------------
-# Constants for Waypoint Tracking
-# -----------------------------
-heading_error_threshold = 5      # Degrees: if error is below, considered "on course"
-distance_threshold = 10.0         # Meters: waypoint reached
-max_rz_thrust = 100.0
-kp = 1.5                       # Proportional gain for heading error
-
-# -----------------------------
-# Speed Controller Settings (mapping to knots)
-# -----------------------------
-# When going straight, command speed should be 5.0 knots
-# When turning hard, command speed should be 1.0 knot
-BASE_FORWARD_THRUST = 84.70    # Corresponds to 5.0 knots
-MIN_FORWARD_THRUST = 7.00     # Corresponds to 1.0 knot
-TURNING_THRESHOLD = 10     # Degrees error above which full speed reduction is applied
-
-# -----------------------------
-# Cross-track Error Controller Gains (for PID)
-# -----------------------------
-K_xte = 2.90    # Proportional gain
-Ki_xte = 0.032  # Integral gain
-KD_xte = 0.07   # Derivative gain for cross-track error
-
-# For the derivative calculation, store previous xte
-prev_xte = 0.0
-
-
-# Create a unique filename based on the current date and time
-log_filename = f"wind_data/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+# Load model and scaler
+model = joblib.load("ML_Models/rf_trained.pkl")
+scaler = joblib.load("ML_Models/rf_scaler.pkl")
+distance_threshold = 10.0 
+log_filename = f"ml_data/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
 with open(log_filename, mode='w', newline='') as logfile:
     log_writer = csv.writer(logfile)
 
     # Write header for every new file
-    log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "RZ Thrust","Forward Thrust", "WP Lat", "WP Lon",'Bearing to WP', 'Wind Speed (knots)', 'Wind Angle (deg)'])
+    log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "RZ Thrust","Forward Thrust", "WP Lat", "WP Lon",'Bearing to WP'])
 
-# -----------------------------
-# GUI Setup
-# -----------------------------
+def compute_features(current_lat, current_lon, current_heading, current_speed, wp_lat, wp_lon, wind_speed, wind_angle, signed_xte):
+    bearing_to_wp = calculate_bearing(current_lat, current_lon, wp_lat, wp_lon)
+    distance = calculate_distance(current_lat, current_lon, wp_lat, wp_lon)
+    heading_error = normalize_angle(bearing_to_wp - current_heading)
+    signed_xte = calculate_signed_xte((current_lat, current_lon), (current_lat, current_lon), (wp_lat, wp_lon))
+    delta_lat = wp_lat - current_lat
+    delta_lon = wp_lon - current_lon
+    if wind_angle is None:
+        wind_angle = 0.0  # or log and return early
+    relative_wind = normalize_angle(wind_angle - current_heading)
+    relative_wind = normalize_angle(wind_angle - current_heading)
+    return np.array([heading_error, signed_xte, current_speed, distance,  relative_wind, wind_speed])
+
+
 root = tk.Tk()
 root.title("Navigation GUI")
 
@@ -137,7 +127,6 @@ def parse_mwv(sentence):
             return None, None
     return None, None
 
-
 def parse_rmc(rmc_sentence):
     parts = rmc_sentence.split(',')
     if parts[0] != '$GPRMC' or parts[2] == '':
@@ -179,9 +168,7 @@ def calculate_signed_xte(current_pos, previous_wp, current_wp):
     return cross / path_length if path_length != 0 else 0.0
 
 
-# -----------------------------
-# Main Waypoint Tracking Loop
-# -----------------------------
+
 def update_gui():
     global path, start_pos, prev_xte
     prev_xte = 0.0  # Initialize previous cross-track error
@@ -190,9 +177,9 @@ def update_gui():
         while start_pos is None:
             send_command('$CCNVO,2,1.0,0,0.0')
             rmc_sentence = ser.readline().decode().strip()
-            lat, lon, hdg, spd = parse_rmc(rmc_sentence)
-            if lat is not None:
-                start_pos = (lat, lon)
+            current_lat, current_lon, heading, speed = parse_rmc(rmc_sentence)
+            if current_lat is not None:
+                start_pos = (current_lat, current_lon)
                 print("Start position acquired:", start_pos)
 
         waypoints = parse_waypoints('waypoints/zigzag.txt')
@@ -218,55 +205,29 @@ def update_gui():
                 if current_lat is None:
                     time.sleep(1)
                     continue
-                # Try reading MWV wind data
                 mwv_sentence = ser.readline().decode().strip()
                 wind_angle, wind_speed = parse_mwv(mwv_sentence)
                 if wind_angle is not None and wind_speed is not None:
                     wind_label.config(text=f"Wind: {wind_angle:.1f}° @ {wind_speed:.1f} kts")
 
 
+                signed_xte = calculate_signed_xte((current_lat, current_lon), previous_wp, current_wp)
+                X = compute_features(current_lat, current_lon, current_heading, current_speed, waypoint_lat, waypoint_lon, wind_speed, wind_angle, signed_xte)
+                X = [0.0 if (x is None or np.isnan(x)) else x for x in X]
+                X_scaled = scaler.transform([X])
                 bearing = calculate_bearing(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 distance = calculate_distance(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 heading_error = normalize_angle(bearing - current_heading)
-                rz_thrust = kp * heading_error
-                rz_thrust = max(-max_rz_thrust, min(rz_thrust, max_rz_thrust))
-
-                # --- Speed Controller ---
-                # If heading error is small, command 5.0 knots; if large, 1.0 knot, else linear interpolation.
-                abs_error = abs(heading_error)
-                if abs_error < heading_error_threshold:
-                    forward_thrust = BASE_FORWARD_THRUST  # 5.0 knots equivalent
-                elif abs_error > TURNING_THRESHOLD:
-                    forward_thrust = MIN_FORWARD_THRUST  # 1.0 knot equivalent
-                else:
-                    reduction = (abs_error - heading_error_threshold) / (TURNING_THRESHOLD - heading_error_threshold)
-                    forward_thrust = BASE_FORWARD_THRUST - reduction * (BASE_FORWARD_THRUST - MIN_FORWARD_THRUST)
-
-                if distance < 15:  # Reduce speed when within twice the distance threshold
-                    forward_thrust = MIN_FORWARD_THRUST - 1.1
-
-                # --- Cross-Track Error Controller with Derivative ---
-                if previous_wp is not None:
-                    try:
-                        signed_xte = calculate_signed_xte((current_lat, current_lon), previous_wp, current_wp)
-                        # Derivative term for xte
-                        derivative_xte = (signed_xte - prev_xte) / dt if dt > 0 else 0.0
-                        prev_xte = signed_xte
-                        xte_correction = K_xte * signed_xte + Ki_xte * signed_xte + KD_xte * derivative_xte
-                        rz_thrust += xte_correction
-                    except Exception as e:
-                        print(f"XTE calculation error: {e}")
-                        signed_xte = 0.0
-                    xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
-                else:
-                    xte_label.config(text="XTE: 0.0 m")
-
+                rz_thrust, forward_thrust = model.predict(X_scaled)[0]
+                rz_thrust = max(min(rz_thrust, 50), -100)
+                forward_thrust = max(min(forward_thrust, 100), 0)
                 thrust_command = f'$CCTHD,{forward_thrust:.2f},0.00,0.00,0.00,0.00,{rz_thrust:.2f},0.00,0.00'
                 send_command(thrust_command)
 
                 speed_label.config(text=f"Speed: {current_speed*1.94384:.1f} kts")
                 heading_label.config(text=f"Heading: {current_heading:.1f}°")
                 distance_label.config(text=f"Distance: {distance:.1f} m")
+                xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
 
                 with open(log_filename, 'a', newline='') as f:  # 'a' for append
                     log_writer = csv.writer(f)
@@ -281,11 +242,9 @@ def update_gui():
                         signed_xte,
                         rz_thrust,
                         forward_thrust,
-                        current_wp[0],
-                        current_wp[1],
-                        bearing,
-                        wind_speed, 
-                        wind_angle
+                        waypoint_lat,
+                        waypoint_lon,
+                        bearing
                     ])  
 
                               
@@ -331,12 +290,12 @@ def update_gui():
                 canvas.draw()
 
                 if distance < distance_threshold:
-                    send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
                     previous_wp = current_wp
                     time.sleep(2)
                     break
                 time.sleep(1)  # 1Hz update rate
-
+        
+        send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
         status_label.config(text="All waypoints reached. Mission complete.")
         ser.close()
 
