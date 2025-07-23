@@ -9,6 +9,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv
 import os
 from datetime import datetime
+import cvxpy as cp
+import numpy as np
+from haversine import haversine
+from scipy.optimize import minimize
 
 # -----------------------------
 # Serial Configuration
@@ -21,7 +25,7 @@ ser = serial.Serial(serial_port, baud_rate, timeout=1)
 # Constants for Waypoint Tracking
 # -----------------------------
 heading_error_threshold = 5      # Degrees: if error is below, considered "on course"
-distance_threshold = 10.0         # Meters: waypoint reached
+distance_threshold = 10        # Meters: waypoint reached
 max_rz_thrust = 100.0
 kp = 1.5                       # Proportional gain for heading error
 
@@ -43,16 +47,20 @@ KD_xte = 0.07   # Derivative gain for cross-track error
 
 # For the derivative calculation, store previous xte
 prev_xte = 0.0
-
+KP_DELTA = 50.0
+MIN_THRUST = 0
+MAX_THRUST = 100
+DT = 1.0
+HORIZON = 10
 
 # Create a unique filename based on the current date and time
-log_filename = f"wind_data/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
 with open(log_filename, mode='w', newline='') as logfile:
     log_writer = csv.writer(logfile)
 
     # Write header for every new file
-    log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "RZ Thrust","Forward Thrust", "WP Lat", "WP Lon",'Bearing to WP', 'Wind Speed (knots)', 'Wind Angle (deg)'])
+    log_writer.writerow(["Time", "Lat", "Lon", "Speed (knots)", "Heading (deg)", "Distance to WP (m)", "Heading Error (deg)", "XTE (m)", "Thrust"])
 
 # -----------------------------
 # GUI Setup
@@ -84,6 +92,56 @@ start_pos = None  # Will be set to the first valid RMC reading
 # -----------------------------
 # Utility Functions
 # -----------------------------
+
+
+def mpc_xy_controller(current_state, reference_state, horizon=HORIZON, dt=DT):
+    # Optimization variables: x and y velocity over horizon
+    vx = cp.Variable(horizon)
+    vy = cp.Variable(horizon)
+
+    # Predicted state variables
+    x = cp.Variable(horizon + 1)
+    y = cp.Variable(horizon + 1)
+
+    # Initial state
+    x0 = current_state['x']
+    y0 = current_state['y']
+
+    xr = reference_state['x']
+    yr = reference_state['y']
+
+    cost = 0
+    constraints = []
+
+    # Initial conditions
+    constraints += [x[0] == x0, y[0] == y0]
+
+    for t in range(horizon):
+        # Position update
+        constraints += [x[t+1] == x[t] + vx[t] * dt]
+        constraints += [y[t+1] == y[t] + vy[t] * dt]
+
+        # Control limits
+        constraints += [vx[t] >= MIN_THRUST, vx[t] <= MAX_THRUST]
+        constraints += [vy[t] >= MIN_THRUST, vy[t] <= MAX_THRUST]
+
+        # Cost: penalize position error and control effort
+        cost += 10.0 * cp.square(x[t+1] - xr)
+        cost += 10.0 * cp.square(y[t+1] - yr)
+        cost += 0.5 * cp.square(vx[t])
+        cost += 0.5 * cp.square(vy[t])
+
+    # Solve the optimization problem
+    prob = cp.Problem(cp.Minimize(cost), constraints)
+    prob.solve(solver=cp.OSQP)
+
+    if prob.status not in ["optimal", "optimal_inaccurate"]:
+        print("MPC failed to solve!")
+        return 0.0, 0.0  # fail-safe
+
+    # Output first control command
+    return vx.value[0], vy.value[0]
+
 def degrees_to_radians(deg):
     return deg * math.pi / 180
 
@@ -124,34 +182,60 @@ def send_command(command):
     if response:
         print("Response:", response.strip())
 
-def parse_mwv(sentence):
-    if sentence.startswith('$IIMWV'):
-        try:
-            parts = sentence.split(',')
-            wind_angle = float(parts[1])
-            reference = parts[2]  # R = relative, T = true
-            wind_speed = float(parts[3])
-            wind_unit = parts[4]  # 'N' = knots
-            return wind_angle, wind_speed
-        except (ValueError, IndexError):
-            return None, None
-    return None, None
+def parse_mwv(mwv_sentence):
+    parts = mwv_sentence.split(',')
+    if len(parts) < 6:
+        return None, None
+    if parts[0] != '$IIMWV':
+        return None, None
+    if parts[5] != 'A':  # Valid flag
+        return None, None
+
+    wind_angle = float(parts[1])
+    wind_speed = float(parts[3])
+    speed_units = parts[4]
+    # Convert to knots if necessary
+    if speed_units == 'K':  # km/h
+        wind_speed *= 0.539957
+    elif speed_units == 'M':  # m/s
+        wind_speed *= 1.94384
+    # 'N' = already knots
+    return wind_angle, wind_speed
+
+
+
 
 
 def parse_rmc(rmc_sentence):
-    parts = rmc_sentence.split(',')
-    if parts[0] != '$GPRMC' or parts[2] == '':
-        return None, None, None, None
-    lat = float(parts[3][:2]) + float(parts[3][2:]) / 60
-    if parts[4] == 'S':
-        lat = -lat
-    lon = float(parts[5][:3]) + float(parts[5][3:]) / 60
-    if parts[6] == 'W':
-        lon = -lon
-    speed_knots = float(parts[7]) if parts[7] else 0.0
-    speed_mps = speed_knots * 0.514444
-    heading = float(parts[8]) if parts[8] else 0.0
-    return lat, lon, heading, speed_mps
+    if not rmc_sentence.startswith('$GPRMC'):
+        return None
+    try:
+        parts = rmc_sentence.strip().split(',')
+        if parts[2] != 'A':  # Data not valid
+            return None
+        if parts[0] != '$GPRMC' or parts[2] == '':
+            lat = float(parts[3][:2]) + float(parts[3][2:]) / 60
+        if parts[4] == 'S':
+            lat = -lat
+        lon = float(parts[5][:3]) + float(parts[5][3:]) / 60
+        if parts[6] == 'W':
+            lon = -lon
+
+        # Extract speed and course
+        speed_knots = float(parts[7])
+        course_deg = float(parts[8])
+
+        # Convert to SI units
+        speed_mps = speed_knots * 0.514444
+        course_rad = np.deg2rad(course_deg)
+
+        vx = speed_mps * np.cos(course_rad)
+        vy = speed_mps * np.sin(course_rad)
+        heading = float(parts[8]) if parts[8] else 0.0
+        return vx, vy, lat, lon, heading
+    except (IndexError, ValueError):
+        return None
+
 
 def parse_waypoints(filename):
     waypoints = []
@@ -185,6 +269,7 @@ def calculate_signed_xte(current_pos, previous_wp, current_wp):
 def update_gui():
     global path, start_pos, prev_xte
     prev_xte = 0.0  # Initialize previous cross-track error
+
     try:
         # Wait for the first valid RMC to set start_pos
         while start_pos is None:
@@ -199,14 +284,14 @@ def update_gui():
         send_command('$CCAPM,0,64,0,80')
         send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
         time.sleep(1)
-        previous_wp = start_pos  # For the first leg
 
+        previous_wp = start_pos
         prev_time = time.time()
-
 
         for index, (waypoint_lat, waypoint_lon) in enumerate(waypoints, start=1):
             current_wp = (waypoint_lat, waypoint_lon)
             status_label.config(text=f"Navigating to Waypoint {index}: ({waypoint_lat}, {waypoint_lon})")
+
             while True:
                 current_time = time.time()
                 dt = current_time - prev_time
@@ -215,80 +300,78 @@ def update_gui():
                 send_command('$CCNVO,2,1.0,0,0.0')
                 rmc_sentence = ser.readline().decode().strip()
                 current_lat, current_lon, current_heading, current_speed = parse_rmc(rmc_sentence)
+
                 if current_lat is None:
                     time.sleep(1)
                     continue
-                # Try reading MWV wind data
+
+                # Parse wind data
                 mwv_sentence = ser.readline().decode().strip()
+                if mwv_sentence.startswith('$IIMWV'):
+                    print("Parsing MWV:", mwv_sentence)
                 wind_angle, wind_speed = parse_mwv(mwv_sentence)
                 if wind_angle is not None and wind_speed is not None:
                     wind_label.config(text=f"Wind: {wind_angle:.1f}° @ {wind_speed:.1f} kts")
 
+                # Navigation states
+                current_state = {
+                    'x': x,  # If you're fusing GPS
+                    'y': y,
+                    'vx': vx,         # From GPRMC
+                    'vy': vy,
+                    'heading': np.rad2deg(np.arctan2(vy, vx))  # Approximate from velocity vector
+}
 
-                bearing = calculate_bearing(current_lat, current_lon, waypoint_lat, waypoint_lon)
+                reference_state = {
+                    'x': waypoint_lat,
+                    'y': waypoint_lon,
+                    'heading': calculate_bearing(current_lat, current_lon, waypoint_lat, waypoint_lon),
+                    'speed': BASE_FORWARD_THRUST
+                }
+
+                forward_thrust, rz_thrust = mpc_xy_controller(current_state, reference_state, dt=dt)
+
+                # Distance to waypoint
                 distance = calculate_distance(current_lat, current_lon, waypoint_lat, waypoint_lon)
-                heading_error = normalize_angle(bearing - current_heading)
-                rz_thrust = kp * heading_error
-                rz_thrust = max(-max_rz_thrust, min(rz_thrust, max_rz_thrust))
 
-                # --- Speed Controller ---
-                # If heading error is small, command 5.0 knots; if large, 1.0 knot, else linear interpolation.
-                abs_error = abs(heading_error)
-                if abs_error < heading_error_threshold:
-                    forward_thrust = BASE_FORWARD_THRUST  # 5.0 knots equivalent
-                elif abs_error > TURNING_THRESHOLD:
-                    forward_thrust = MIN_FORWARD_THRUST  # 1.0 knot equivalent
-                else:
-                    reduction = (abs_error - heading_error_threshold) / (TURNING_THRESHOLD - heading_error_threshold)
-                    forward_thrust = BASE_FORWARD_THRUST - reduction * (BASE_FORWARD_THRUST - MIN_FORWARD_THRUST)
-
-                if distance < 15:  # Reduce speed when within twice the distance threshold
-                    forward_thrust = MIN_FORWARD_THRUST - 1.1
-
-                # --- Cross-Track Error Controller with Derivative ---
+                # Cross-Track Error correction
+                signed_xte = 0.0
                 if previous_wp is not None:
                     try:
                         signed_xte = calculate_signed_xte((current_lat, current_lon), previous_wp, current_wp)
-                        # Derivative term for xte
                         derivative_xte = (signed_xte - prev_xte) / dt if dt > 0 else 0.0
                         prev_xte = signed_xte
                         xte_correction = K_xte * signed_xte + Ki_xte * signed_xte + KD_xte * derivative_xte
                         rz_thrust += xte_correction
                     except Exception as e:
                         print(f"XTE calculation error: {e}")
-                        signed_xte = 0.0
-                    xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
-                else:
-                    xte_label.config(text="XTE: 0.0 m")
+                xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
 
+
+                # Send thrust command
                 thrust_command = f'$CCTHD,{forward_thrust:.2f},0.00,0.00,0.00,0.00,{rz_thrust:.2f},0.00,0.00'
                 send_command(thrust_command)
 
+                # GUI Labels
                 speed_label.config(text=f"Speed: {current_speed*1.94384:.1f} kts")
                 heading_label.config(text=f"Heading: {current_heading:.1f}°")
                 distance_label.config(text=f"Distance: {distance:.1f} m")
 
-                with open(log_filename, 'a', newline='') as f:  # 'a' for append
+                # Log data
+                with open(log_filename, 'a', newline='') as f:
                     log_writer = csv.writer(f)
                     log_writer.writerow([
                         time.strftime("%Y-%m-%d %H:%M:%S"),
                         current_lat,
                         current_lon,
-                        current_speed*1.94384,
+                        current_speed * 1.94384,
                         current_heading,
                         distance,
-                        heading_error,
+                        reference_state['heading'] - current_heading,
                         signed_xte,
-                        rz_thrust,
-                        forward_thrust,
-                        current_wp[0],
-                        current_wp[1],
-                        bearing,
-                        wind_speed, 
-                        wind_angle
-                    ])  
+                        rz_thrust
+                    ])
 
-                              
                 # --- Visualization ---
                 ax.clear()
                 ax.set_title("Navigation Visualisation")
@@ -297,12 +380,11 @@ def update_gui():
                 ax.set_xlim(min(wp[1] for wp in waypoints) - 0.001, max(wp[1] for wp in waypoints) + 0.001)
                 ax.set_ylim(min(wp[0] for wp in waypoints) - 0.0001, max(wp[0] for wp in waypoints) + 0.0001)
 
-                # Plot start -> first waypoint line
                 if previous_wp == start_pos:
                     first_wp = waypoints[0]
                     ax.plot([start_pos[1], first_wp[1]], [start_pos[0], first_wp[0]], 'g--', label='Start -> First WP')
 
-                # Plot planned route and waypoints
+                # Route and waypoints
                 waypoints_lons = [wp[1] for wp in waypoints]
                 waypoints_lats = [wp[0] for wp in waypoints]
                 ax.plot(waypoints_lons, waypoints_lats, 'k--', linewidth=1, label='Planned Route')
@@ -311,17 +393,16 @@ def update_gui():
                     ax.plot(lonW, latW, color, markersize=5)
                     ax.text(lonW, latW, f"W{i}", fontsize=8, verticalalignment='bottom')
 
-                # Plot current position and heading arrow
+                # Current position and heading
                 ax.plot(current_lon, current_lat, 'go', markersize=10, label="Current Position")
                 arrow_length = 0.0001
-                # Convert current heading: if 0° means North, math angle = 90 - current_heading
                 plot_heading = 90 - current_heading
                 dx = arrow_length * math.cos(math.radians(plot_heading))
                 dy = arrow_length * math.sin(math.radians(plot_heading))
                 ax.annotate("", xy=(current_lon + dx, current_lat + dy), xytext=(current_lon, current_lat),
                             arrowprops=dict(arrowstyle="->", color='g', lw=2))
 
-                # Plot path taken
+                # Path taken
                 path.append((current_lat, current_lon))
                 if len(path) > 1:
                     path_lons = [p[1] for p in path]
@@ -330,12 +411,14 @@ def update_gui():
                 ax.legend()
                 canvas.draw()
 
+                # Check if waypoint is reached
                 if distance < distance_threshold:
                     send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
                     previous_wp = current_wp
                     time.sleep(2)
                     break
-                time.sleep(1)  # 1Hz update rate
+
+                time.sleep(1)  # Loop at 1Hz
 
         status_label.config(text="All waypoints reached. Mission complete.")
         ser.close()

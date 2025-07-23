@@ -9,6 +9,17 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv
 import os
 from datetime import datetime
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import random
+import numpy as np
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+state_size = 4  # Example: if your features have 7 elements
+action_size = 2  # [rz_thrust, forward_thrust]
+
 
 # -----------------------------
 # Serial Configuration
@@ -23,30 +34,151 @@ ser = serial.Serial(serial_port, baud_rate, timeout=1)
 heading_error_threshold = 5      # Degrees: if error is below, considered "on course"
 distance_threshold = 10.0         # Meters: waypoint reached
 max_rz_thrust = 100.0
-kp = 1.5                       # Proportional gain for heading error
+BASE_FORWARD_THRUST = 83.3  # approx 5 knots
+MAX_THRUST = 100.0
+MIN_THRUST = 0.0
 
 # -----------------------------
-# Speed Controller Settings (mapping to knots)
+# Reinforcement Learning 
 # -----------------------------
-# When going straight, command speed should be 5.0 knots
-# When turning hard, command speed should be 1.0 knot
-BASE_FORWARD_THRUST = 84.70    # Corresponds to 5.0 knots
-MIN_FORWARD_THRUST = 7.00     # Corresponds to 1.0 knot
-TURNING_THRESHOLD = 10     # Degrees error above which full speed reduction is applied
+class QNetwork(nn.Module):
+    def __init__(self, state_size, action_size, hidden_size=64):
+        super(QNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, action_size)
 
-# -----------------------------
-# Cross-track Error Controller Gains (for PID)
-# -----------------------------
-K_xte = 2.90    # Proportional gain
-Ki_xte = 0.032  # Integral gain
-KD_xte = 0.07   # Derivative gain for cross-track error
-
-# For the derivative calculation, store previous xte
-prev_xte = 0.0
+    def forward(self, state):
+        x = torch.relu(self.fc1(state))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
 
 
+class DQNAgent:
+    def __init__(self, state_size, action_size, device='cpu'):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.device = device
+
+        self.qnetwork_local = QNetwork(state_size, action_size).to(device)
+        self.qnetwork_target = QNetwork(state_size, action_size).to(device)
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=1e-3)
+
+        self.memory = deque(maxlen=10000)
+        self.batch_size = 64
+        self.gamma = 0.99
+        self.tau = 0.001
+        self.epsilon = 1.0  # Start with full random
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.05
+
+
+    def act(self, state):
+        if random.random() < self.epsilon:
+            # Random action
+            return np.random.uniform(low=[-100, 0], high=[50, 100])
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action = self.qnetwork_local(state)
+        return action.cpu().numpy()[0]
+
+    def step(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+        if len(self.memory) > self.batch_size:
+            self.learn()
+
+    def learn(self):
+        experiences = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states, dones = zip(*experiences)
+
+        states = torch.FloatTensor(states).to(self.device)
+        actions = torch.FloatTensor(actions).to(self.device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
+        next_states = torch.FloatTensor(next_states).to(self.device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
+
+        Q_expected = self.qnetwork_local(states)
+        Q_expected = Q_expected.gather(1, (actions > 0).long().unsqueeze(1))  # Approximate
+
+        Q_targets_next = self.qnetwork_target(next_states).detach().max(1)[0].unsqueeze(1)
+        Q_targets = rewards + (self.gamma * Q_targets_next * (1 - dones))
+
+        loss = nn.MSELoss()(Q_expected, Q_targets)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # Update target network slowly
+        for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+
+        # Decrease epsilon
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def memorize(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+        
+        minibatch = random.sample(self.memory, self.batch_size)
+        
+        states = torch.cat([m[0] for m in minibatch]).to(self.device)
+        actions = torch.tensor([m[1] for m in minibatch], dtype=torch.float32).to(self.device)
+        rewards = torch.tensor([m[2] for m in minibatch], dtype=torch.float32).unsqueeze(1).to(self.device)
+        next_states = torch.cat([m[3] for m in minibatch]).to(self.device)
+        dones = torch.tensor([m[4] for m in minibatch], dtype=torch.float32).unsqueeze(1).to(self.device)
+        
+        q_values = self.model(states)
+        target_q_values = self.model(next_states).detach()
+        
+        # Predicted value of taken action
+        pred = q_values
+        
+        # Target value
+        target = actions + self.gamma * target_q_values * (1 - dones)
+        
+        loss = self.loss_fn(pred, target)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+agent = DQNAgent(state_size, action_size, device)
+def compute_features(current_lat, current_lon, current_heading, current_speed, wp_lat, wp_lon, wind_speed, wind_angle, signed_xte):
+    bearing_to_wp = calculate_bearing(current_lat, current_lon, wp_lat, wp_lon)
+    distance = calculate_distance(current_lat, current_lon, wp_lat, wp_lon)
+    heading_error = normalize_angle(bearing_to_wp - current_heading)
+    signed_xte = calculate_signed_xte((current_lat, current_lon), (current_lat, current_lon), (wp_lat, wp_lon))
+    delta_lat = wp_lat - current_lat
+    delta_lon = wp_lon - current_lon
+    if wind_angle is None or np.isnan(wind_angle):
+        wind_angle = 0.0
+    if wind_speed is None or np.isnan(wind_speed):
+        wind_speed = 0.0
+    relative_wind = normalize_angle(wind_angle - current_heading)
+    return np.array([heading_error, distance, relative_wind, wind_speed])
+
+def parse_waypoints(filename):
+    waypoints = []
+    with open(filename, 'r') as file:
+        for line in file:
+            parts = line.strip().split(',')
+            if parts[0] == '$MMWPL':
+                lat = float(parts[1][:2]) + float(parts[1][2:]) / 60
+                if parts[2] == 'S':
+                    lat = -lat
+                lon = float(parts[3][:3]) + float(parts[3][3:]) / 60
+                if parts[4] == 'W':
+                    lon = -lon
+                waypoints.append((lat, lon))
+    return waypoints
 # Create a unique filename based on the current date and time
-log_filename = f"wind_data/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+log_filename = f"PID_Controller/PID_DATA/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
 with open(log_filename, mode='w', newline='') as logfile:
     log_writer = csv.writer(logfile)
@@ -153,20 +285,6 @@ def parse_rmc(rmc_sentence):
     heading = float(parts[8]) if parts[8] else 0.0
     return lat, lon, heading, speed_mps
 
-def parse_waypoints(filename):
-    waypoints = []
-    with open(filename, 'r') as file:
-        for line in file:
-            parts = line.strip().split(',')
-            if parts[0] == '$MMWPL':
-                lat = float(parts[1][:2]) + float(parts[1][2:]) / 60
-                if parts[2] == 'S':
-                    lat = -lat
-                lon = float(parts[3][:3]) + float(parts[3][3:]) / 60
-                if parts[4] == 'W':
-                    lon = -lon
-                waypoints.append((lat, lon))
-    return waypoints
 
 def calculate_signed_xte(current_pos, previous_wp, current_wp):
     latA_rad = math.radians(previous_wp[0])
@@ -184,9 +302,8 @@ def calculate_signed_xte(current_pos, previous_wp, current_wp):
 # -----------------------------
 def update_gui():
     global path, start_pos, prev_xte
-    prev_xte = 0.0  # Initialize previous cross-track error
     try:
-        # Wait for the first valid RMC to set start_pos
+        # Wait for first valid RMC
         while start_pos is None:
             send_command('$CCNVO,2,1.0,0,0.0')
             rmc_sentence = ser.readline().decode().strip()
@@ -199,7 +316,7 @@ def update_gui():
         send_command('$CCAPM,0,64,0,80')
         send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
         time.sleep(1)
-        previous_wp = start_pos  # For the first leg
+        previous_wp = start_pos
 
         prev_time = time.time()
 
@@ -218,48 +335,43 @@ def update_gui():
                 if current_lat is None:
                     time.sleep(1)
                     continue
-                # Try reading MWV wind data
+
                 mwv_sentence = ser.readline().decode().strip()
                 wind_angle, wind_speed = parse_mwv(mwv_sentence)
                 if wind_angle is not None and wind_speed is not None:
                     wind_label.config(text=f"Wind: {wind_angle:.1f}° @ {wind_speed:.1f} kts")
 
-
                 bearing = calculate_bearing(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 distance = calculate_distance(current_lat, current_lon, waypoint_lat, waypoint_lon)
                 heading_error = normalize_angle(bearing - current_heading)
-                rz_thrust = kp * heading_error
-                rz_thrust = max(-max_rz_thrust, min(rz_thrust, max_rz_thrust))
-
-                # --- Speed Controller ---
-                # If heading error is small, command 5.0 knots; if large, 1.0 knot, else linear interpolation.
-                abs_error = abs(heading_error)
-                if abs_error < heading_error_threshold:
-                    forward_thrust = BASE_FORWARD_THRUST  # 5.0 knots equivalent
-                elif abs_error > TURNING_THRESHOLD:
-                    forward_thrust = MIN_FORWARD_THRUST  # 1.0 knot equivalent
+                if abs(heading_error) < heading_error_threshold:
+                    speed_error = current_speed - 5.0
                 else:
-                    reduction = (abs_error - heading_error_threshold) / (TURNING_THRESHOLD - heading_error_threshold)
-                    forward_thrust = BASE_FORWARD_THRUST - reduction * (BASE_FORWARD_THRUST - MIN_FORWARD_THRUST)
+                    speed_error = current_speed - 0.0
 
-                if distance < 15:  # Reduce speed when within twice the distance threshold
-                    forward_thrust = MIN_FORWARD_THRUST - 1.1
 
-                # --- Cross-Track Error Controller with Derivative ---
+                # --- Cross-Track Error PID ---
                 if previous_wp is not None:
                     try:
+
                         signed_xte = calculate_signed_xte((current_lat, current_lon), previous_wp, current_wp)
-                        # Derivative term for xte
-                        derivative_xte = (signed_xte - prev_xte) / dt if dt > 0 else 0.0
-                        prev_xte = signed_xte
-                        xte_correction = K_xte * signed_xte + Ki_xte * signed_xte + KD_xte * derivative_xte
-                        rz_thrust += xte_correction
+
                     except Exception as e:
                         print(f"XTE calculation error: {e}")
                         signed_xte = 0.0
                     xte_label.config(text=f"XTE: {abs(signed_xte):.1f} m")
                 else:
                     xte_label.config(text="XTE: 0.0 m")
+
+                features = compute_features(current_lat, current_lon, current_heading, current_speed, waypoint_lat, waypoint_lon, wind_speed, wind_angle, signed_xte)
+                # Predict action using agent
+                state = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+                action = agent.act(state)
+
+                rz_thrust = np.clip(action[0], -50, 50)
+                forward_thrust = np.clip(action[1], 0, 100)
+                if distance < 20:
+                    forward_thrust = MIN_THRUST  # crawl at very low thrust near waypoint
 
                 thrust_command = f'$CCTHD,{forward_thrust:.2f},0.00,0.00,0.00,0.00,{rz_thrust:.2f},0.00,0.00'
                 send_command(thrust_command)
@@ -331,13 +443,13 @@ def update_gui():
                 canvas.draw()
 
                 if distance < distance_threshold:
-                    send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
                     previous_wp = current_wp
-                    time.sleep(2)
+                    time.sleep(1)
                     break
                 time.sleep(1)  # 1Hz update rate
 
         status_label.config(text="All waypoints reached. Mission complete.")
+        send_command('$CCTHD,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00')
         ser.close()
 
     except KeyboardInterrupt:
