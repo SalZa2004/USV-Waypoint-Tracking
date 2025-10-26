@@ -9,7 +9,7 @@ Setup of the hardware:
 
 Below is the results obtained from experimenting the Random-Forest Enhanced MPC
 <p align="center">
-  <img src="Results.png" width="600" alt="Zigzag Path results"/>
+  <img src="archive/Results.png" width="600" alt="Zigzag Path results"/>
 </p>
 
 
